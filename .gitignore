@@ -1,0 +1,13 @@
+.DS_Store
+__pycache__/
+*.py[cod]
+
+# Generated fixtures and receiver output
+*.bin
+rebuilt/
+*.part
+*.assembling
+
+# Generated benchmark output and local backups
+results*.csv
+*.pre-*-backup
