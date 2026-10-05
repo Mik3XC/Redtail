@@ -1,4 +1,4 @@
-# DarkRock TCP / XMT4
+# RedTail TCP / XMT4
 
 XMT4 is an experimental Python file transport for studying authenticated TCP
 records, compact control fields, GF(256) transforms, and Reed–Solomon 4+2
