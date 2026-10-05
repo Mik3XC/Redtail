@@ -696,8 +696,11 @@ def unpack_blob(path, outdir):
     outputs, seen = [], set()
     with open(path, "rb") as src:
         magic, count = BLOB_HEAD.unpack(recv_file_exact(src, BLOB_HEAD.size))
-        if magic != BLOB_MAGIC or count > 100000:
-            raise ValueError("invalid XBL1 blob header")
+        if magic != BLOB_MAGIC:
+            raise ValueError(f"{path!r} is not an XBL1 blob (header={magic!r}); "
+                             "use the session ID printed by a send command with --blob")
+        if count > 100000:
+            raise ValueError(f"{path!r} declares too many XBL1 entries: {count}")
         for _ in range(count):
             name_len, size = BLOB_ENTRY.unpack(recv_file_exact(src, BLOB_ENTRY.size))
             if not 0 < name_len <= 4096:
@@ -926,8 +929,11 @@ def main():
         while True:
             print(rx.collect(), flush=True)
     elif a.cmd == "unpack-blob":
-        for output in unpack_blob(a.blob, a.out):
-            print(output)
+        try:
+            for output in unpack_blob(a.blob, a.out):
+                print(output)
+        except (OSError, UnicodeError, ValueError) as error:
+            ap.error(str(error))
     else:
         cipher = "stream" if a.mode == "stream" else a.cipher
         blob_path = build_blob(a.files) if a.blob else None
