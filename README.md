@@ -83,6 +83,89 @@ Blob mode uses a temporary local container equal to approximately the combined
 input size. Use `tar` or ZIP before XMT when compression or broader archive
 metadata is required.
 
+## Folders and local file drop
+
+### Folders (`-r`, `-L`)
+
+Folders need `-r`, like `cp`. The folder keeps its own name as the top level,
+so `-r ./photos` gives `photos/a.jpg`, `photos/2026/b.jpg`, and so on.
+
+- Symlinks are skipped by default. Each skip says why: a link (and where it
+  points), a broken link, or a special file such as a pipe or socket.
+- `-L` / `--follow-links` packs what a link points to under the link's own name,
+  like `cp -L`. Broken links and folder loops are still skipped. A link to a
+  file that is also packed directly is stored twice.
+- macOS volume folders (`.Spotlight-V100`, `.fseventsd`, `.Trashes`,
+  `.TemporaryItems`, `.DocumentRevisions-V100`) and the `--drop` folder itself
+  are left out, so a drive can be packed onto itself.
+- Folders that cannot be read are reported and skipped.
+
+### Local file drop (`--drop DIR`)
+
+`--drop DIR` replaces `--to` and runs the same pipeline (handshake, AEAD records,
+SPF arms, RS42 shards) over loopback into a local folder, such as an SSD. No
+separate receiver is needed. Each file is staged on that disk, checked against
+its source by SHA-256, then moved to `DIR/<relative path>`.
+
+- Existing files are never replaced; the run stops before sending if any target
+  exists.
+- A file that fails verification stays in `DIR/.redtail-staging` for inspection.
+- Free space is checked first. The target disk needs about the total size plus
+  the largest file (the receiver briefly holds a part and its assembly). With
+  `--blob`, the temporary container also needs the total size in `TMPDIR`.
+- The disk receives the decoded files, not the RS42 shards: RS42 protects the
+  transfer, and the drop proves the round trip.
+- XMT4 does not compress. Output size equals input size.
+
+### Examples
+
+```bash
+# Pack a folder onto an SSD, one session per file
+python3.10 redtail.py send -r ./dir --drop /Volumes/SSD/test
+
+# Same, with RS42 and two shards deliberately dropped
+python3.10 redtail.py send -r ./dir --drop /Volumes/SSD/test \
+  --RS42 --drop-shards 2 3
+
+# Many small files: one XBL1 container instead of one session each
+python3.10 redtail.py send -r ./dir --drop /Volumes/SSD/test --blob
+python3.10 redtail.py unpack-blob /Volumes/SSD/test/redtail-blob-*.xbl1 --out ./restored
+
+# Pack a whole drive onto itself, following symlinks
+python3.10 redtail.py send -r -L "/Volumes/SSD" \
+  --drop "/Volumes/SSD/redtail-test" \
+  --blob --RS42 --drop-shards 2 3 --mode record
+
+# Put the --blob temporary container on a disk with room
+TMPDIR=/Volumes/Other python3.10 redtail.py send -r ./dir \
+  --drop /Volumes/SSD/test --blob
+
+# Folders over the network work the same way
+python3.10 redtail.py send -r ./dir --to REMOTE_HOST:47000 --blob
+```
+
+Check space before a large run, and compare after unpacking:
+
+```bash
+df -h /Volumes/SSD ~
+python3.10 redtail.py unpack-blob "/Volumes/SSD/redtail-test/"redtail-blob-*.xbl1 --out ~/restore
+diff -rq "/Volumes/SSD" ~/restore/SSD
+```
+
+`diff` will list the skipped volume folders and `redtail-test` as missing; any
+other line is a real difference. Delete `redtail-test` between runs, or the next
+run packs the previous container too.
+
+### Notes
+
+- `-r` with `--blob` stores relative paths in XBL1 names; `unpack-blob`
+  recreates the folders and refuses absolute paths, `..` and duplicates.
+- `unpack-blob` accepts at most 100,000 entries; drop `--blob` above that.
+- `--HUNTSPF`/`--HUNTSPF2` are not applied under `--RS42` and are rejected; use
+  `--HUNTSPF3` or `--HUNTSPF4` to compose with RS42.
+- A file smaller than `--streams` uses fewer streams; a failed sender stream
+  stops the run instead of hanging it.
+
 ## Experimental modes
 
 ```bash

@@ -22,10 +22,10 @@ Modes:
   pdu    print per-packet (PDU) math
   bench  receiver + sender on loopback (127.0.0.1 -> 127.0.0.2), sweep settings
   recv   listen and rebuild files                (real two-host use)
-  send   send one or more independent files      (real two-host use)
+  send   send files or folders (-r) to a host (--to) or a local disk (--drop)
   unpack-blob  safely extract an XBL1 container
 """
-import argparse, csv, hashlib, hmac, multiprocessing as mp, os, socket, struct, sys, tempfile, time
+import argparse, csv, hashlib, hmac, multiprocessing as mp, os, queue, shutil, socket, struct, sys, tempfile, time
 from cryptography.hazmat.primitives import hashes, serialization
 from cryptography.hazmat.primitives.asymmetric import ec, x25519
 from cryptography.hazmat.primitives.ciphers import Cipher, algorithms, modes
@@ -58,6 +58,33 @@ BLOB_ENTRY = struct.Struct("!HQ")      # UTF-8 basename length, file size
 QUICK_START = ("python3 redtail.py send file-1.bin file-2.bin file-3.bin "
                "--to 10.0.0.1:47000 --blob --mode record --HUNTSPF3 "
                "--RS42 --drop-shards 0 2")
+SEND_EXAMPLES = """Examples:
+  # network: one session per file, or one --blob session
+  python3 redtail.py send a.bin b.bin --to 10.0.0.1:47000
+  python3 redtail.py send -r ./dir --to 10.0.0.1:47000 --blob
+
+  # local file drop onto a disk, verified by SHA-256 (no receiver needed)
+  python3 redtail.py send -r ./dir --drop /Volumes/SSD/test
+  python3 redtail.py send -r ./dir --drop /Volumes/SSD/test --RS42 --drop-shards 2 3
+
+  # pack a whole drive into one container on itself, following symlinks
+  python3 redtail.py send -r -L "/Volumes/SSD" --drop "/Volumes/SSD/redtail-test" \\
+    --blob --RS42 --drop-shards 2 3 --mode record
+  python3 redtail.py unpack-blob "/Volumes/SSD/redtail-test/"redtail-blob-*.xbl1 --out ~/restore
+
+  # put the --blob temporary container on another disk
+  TMPDIR=/Volumes/Other python3 redtail.py send -r ./dir --drop /Volumes/SSD/test --blob
+
+  # full lab mode: SPF3 arms inside RS42 with two lost shards
+  """ + QUICK_START + """
+
+Notes:
+  folders need -r; symlinks are skipped unless -L; macOS volume folders
+  (.Spotlight-V100, .fseventsd, .Trashes, ...) and the --drop folder are left out
+  --drop checks free space first: about total + largest file on the target disk,
+  plus total in TMPDIR when --blob is used; existing files are never replaced
+  --HUNTSPF/--HUNTSPF2 do not combine with --RS42; use --HUNTSPF3/4
+  XMT4 never compresses: output size equals input size"""
 
 
 # ---------------------------------------------------------------- crypto helpers
@@ -631,6 +658,7 @@ def send_file(host, port, path, streams, rec, curve="x25519", cipher="aes256gcm"
     if not 1 <= streams <= 65535:
         raise ValueError("streams must be from 1 to 65535")
     size = os.path.getsize(path)
+    streams = max(1, min(streams, size))        # never more stripes than bytes (tiny/empty files)
     session = os.urandom(16)
     step = -(-size // streams)
     q = CTX.Queue()
@@ -642,7 +670,16 @@ def send_file(host, port, path, streams, rec, curve="x25519", cipher="aes256gcm"
              for i in range(streams)]
     for p in procs:
         p.start()
-    res = [q.get() for _ in procs]
+    res = []
+    while len(res) < len(procs):                # fail fast if a stripe process dies
+        try:
+            res.append(q.get(timeout=1))
+        except queue.Empty:
+            dead = [p for p in procs if p.exitcode not in (None, 0)]
+            if dead:
+                for p in procs:
+                    p.terminate()
+                raise RuntimeError(f"{len(dead)} sender stream(s) failed for {path}")
     elapsed = time.perf_counter() - t0
     for p in procs:
         p.join()
@@ -656,19 +693,121 @@ def send_file(host, port, path, streams, rec, curve="x25519", cipher="aes256gcm"
             "received_shards": [i for i in range(6) if shard_mask & (1 << i)]}
 
 
+# ---------------------------------------------------------------- input expansion
+def safe_relname(name):
+    """Check a '/'-separated relative name and return it as a local relative path."""
+    parts = name.split("/")
+    if (not name or name.startswith("/") or "\\" in name or "\x00" in name
+            or any(part in ("", ".", "..") for part in parts)):
+        raise ValueError(f"unsafe relative name: {name!r}")
+    return os.path.join(*parts)
+
+
+VOLUME_JUNK = {".Spotlight-V100", ".fseventsd", ".Trashes", ".TemporaryItems",
+               ".DocumentRevisions-V100", ".redtail-staging"}
+
+
+def free_bytes(path):
+    """Free space on the disk that holds path (or its nearest existing parent)."""
+    path = os.path.abspath(path)
+    while not os.path.exists(path):
+        path = os.path.dirname(path)
+    return shutil.disk_usage(path).free
+
+
+def skip_reason(path):
+    """Say why a path is not packed as a regular file."""
+    if os.path.islink(path):
+        target = os.readlink(path)
+        if not os.path.exists(path):
+            return f"broken symlink -> {target}"
+        return f"symlink -> {target} (add -L to pack what it points to)"
+    if not os.path.exists(path):
+        return "vanished or unreadable"
+    return "special file (pipe, socket or device)"
+
+
+def expand_inputs(items, recursive=False, exclude=None, follow=False):
+    """Turn files and directories into (path, relative name) pairs.
+
+    A file keeps its basename. A directory needs -r, like cp, and keeps its own
+    name as the top folder: `-r ./photos` gives photos/a.jpg, photos/2026/b.jpg.
+    Symlinks are skipped unless follow=True (-L), which packs the file or folder
+    they point to under the link's own name, like cp -L. Special files are always
+    skipped. macOS volume metadata folders and the `exclude` folder (the --drop
+    target) are left out.
+    """
+    out, seen = [], set()
+    exclude = os.path.realpath(exclude) if exclude else None
+
+    def add(path, rel):
+        if rel in seen:
+            raise ValueError(f"two inputs map to the same name: {rel}")
+        seen.add(rel)
+        out.append((path, rel))
+
+    def unreadable(err):
+        print(f"skip unreadable: {err.filename}", file=sys.stderr)
+
+    for item in items:
+        if os.path.islink(item) and not follow:
+            print(f"skip {item}: {skip_reason(item)}", file=sys.stderr)
+        elif os.path.isfile(item):
+            add(item, os.path.basename(os.path.normpath(item)))
+        elif not os.path.isdir(item):
+            raise ValueError(f"not a file or directory: {item}")
+        elif not recursive:
+            raise ValueError(f"{item} is a directory (add -r to include it)")
+        else:
+            top = os.path.basename(os.path.abspath(item)) or "root"
+            visited = {os.path.realpath(item)}        # guards -L against symlink loops
+            for root, dirs, files in os.walk(item, onerror=unreadable, followlinks=follow):
+                keep = []
+                for d in sorted(dirs):
+                    full = os.path.join(root, d)
+                    real = os.path.realpath(full)
+                    if d in VOLUME_JUNK or (exclude and real == exclude):
+                        continue
+                    if os.path.islink(full):
+                        if not follow:
+                            print(f"skip {full}: {skip_reason(full)}", file=sys.stderr)
+                            continue
+                        if real in visited:
+                            print(f"skip {full}: symlink loop", file=sys.stderr)
+                            continue
+                    visited.add(real)
+                    keep.append(d)
+                dirs[:] = keep
+                for name in sorted(files):
+                    path = os.path.join(root, name)
+                    if (os.path.islink(path) and not follow) or not os.path.isfile(path):
+                        print(f"skip {path}: {skip_reason(path)}", file=sys.stderr)
+                        continue
+                    rel = os.path.relpath(path, item).replace(os.sep, "/")
+                    add(path, f"{top}/{rel}")
+    if not out:
+        raise ValueError("no regular files found in the inputs")
+    return out
+
+
 # ---------------------------------------------------------------- blob container
-def build_blob(paths):
-    """Build one uncompressed XBL1 container and return its temporary path."""
+def build_blob(items):
+    """Build one uncompressed XBL1 container and return its temporary path.
+
+    items are paths (stored by basename) or (path, relative name) pairs from
+    expand_inputs; relative names may contain '/' to keep folder structure.
+    """
     entries, seen = [], set()
-    for path in paths:
+    for item in items:
+        path, name = item if isinstance(item, tuple) else (item, os.path.basename(os.path.normpath(item)))
         if not os.path.isfile(path):
             raise ValueError(f"blob input is not a regular file: {path}")
-        name = os.path.basename(os.path.normpath(path))
+        safe_relname(name)
         encoded = name.encode("utf-8")
-        if not encoded or len(encoded) > 65535 or name in (".", ".."):
-            raise ValueError(f"invalid blob basename: {name!r}")
+        if len(encoded) > 4096:
+            raise ValueError(f"blob name longer than 4096 bytes: {name!r}")
         if name in seen:
-            raise ValueError(f"duplicate blob basename: {name}")
+            raise ValueError(f"duplicate blob name: {name}")
         seen.add(name)
         entries.append((path, encoded, os.path.getsize(path)))
     tmp = tempfile.NamedTemporaryFile(prefix="xmt4-", suffix=".blob", delete=False)
@@ -706,10 +845,15 @@ def unpack_blob(path, outdir):
             if not 0 < name_len <= 4096:
                 raise ValueError("invalid XBL1 filename length")
             name = bytes(recv_file_exact(src, name_len)).decode("utf-8")
-            if name != os.path.basename(name) or name in (".", "..") or name in seen:
-                raise ValueError("unsafe or duplicate XBL1 filename")
+            if name in seen:
+                raise ValueError(f"duplicate XBL1 filename: {name!r}")
             seen.add(name)
-            target = os.path.join(outdir, name)
+            target = os.path.join(outdir, safe_relname(name))
+            parent = os.path.dirname(target)
+            os.makedirs(parent, exist_ok=True)
+            root = os.path.realpath(outdir)
+            if os.path.commonpath([root, os.path.realpath(parent)]) != root:
+                raise ValueError(f"XBL1 entry escapes the output directory: {name!r}")
             fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
             try:
                 remaining = size
@@ -733,6 +877,85 @@ def recv_file_exact(fileobj, n):
             raise ValueError("truncated XBL1 blob")
         data.extend(block)
     return bytes(data)
+
+
+# ---------------------------------------------------------------- local drop
+def sha256_file(path):
+    h = hashlib.sha256()
+    with open(path, "rb") as f:
+        while block := f.read(1 << 20):
+            h.update(block)
+    return h.digest()
+
+
+def send_report(label, r):
+    if r["size"] < 1 << 20:
+        amount = f"{r['size']} B"
+        rate = f"{r['size'] / max(r['elapsed'], 1e-9) / 1024:.1f} KiB/s"
+    else:
+        amount = f"{r['size'] / 2**20:.1f} MiB"
+        rate = f"{r['size'] / r['elapsed'] / 1e6:.1f} MB/s"
+    line = (f"{label} -> {r['session']}.bin: path MSS {r['mss']} B -> record {r['record']} B | "
+            f"{r['records']} records | {amount} in {r['elapsed']:.3f}s = {rate}")
+    if r["spf_level"] >= 3 and r["rs42"]:
+        line += (f" | SPF{r['spf_level']}+RS42 shards {r['received_shards']} payload "
+                 f"{r['arm_payload_bytes'] / 2**20:.1f} MiB")
+    elif r["spf_level"] >= 3:
+        line += f" | SPF{r['spf_level']} arm payload {r['arm_payload_bytes'] / 2**20:.1f} MiB"
+    elif r["rs42"]:
+        line += f" | RS42 shards {r['received_shards']} payload {r['arm_payload_bytes'] / 2**20:.1f} MiB"
+    return line
+
+
+def local_drop(jobs, dest, streams=1, **send_kw):
+    """Run the full XMT4 pipeline over loopback into a local folder (an SSD, say).
+
+    Every job goes through the same handshake, AEAD records, SPF arms and RS42
+    shards as a network send. The receiver stages into DEST/.redtail-staging on
+    the same disk, each result is checked against the source by SHA-256, then
+    moved to DEST/<relative name>. Existing files are never replaced; a mismatch
+    stays in staging for inspection. Returns (placed, failed) lists.
+    """
+    dest = os.path.abspath(dest)
+    targets = [os.path.join(dest, safe_relname(rel)) for _, _, rel in jobs]
+    clashes = [t for t in targets if os.path.lexists(t)]
+    if clashes:
+        raise ValueError(f"{len(clashes)} target(s) already exist, e.g. {clashes[0]}")
+    sizes = [os.path.getsize(path) for _, path, _ in jobs]
+    need = sum(sizes) + max(sizes)                # results plus one part+assembly overlap
+    have = free_bytes(dest)
+    if need > have:
+        raise ValueError(f"--drop needs about {need / 1e9:.1f} GB free on {dest}, "
+                         f"only {have / 1e9:.1f} GB available")
+    stage = os.path.join(dest, ".redtail-staging")
+    rx = Receiver("127.0.0.1", 0, stage, max(2, streams))
+    port = rx.lsock.getsockname()[1]
+    placed, failed = [], []
+    t0 = time.perf_counter()
+    try:
+        for (label, path, _), target in zip(jobs, targets):
+            r = send_file("127.0.0.1", port, path, streams, **send_kw)
+            v = rx.collect()
+            ok = v["ok"] and sha256_file(v["path"]) == sha256_file(path)
+            if ok:
+                os.makedirs(os.path.dirname(target), exist_ok=True)
+                os.replace(v["path"], target)
+                placed.append(target)
+            else:
+                failed.append(v["path"])
+            print(f"{send_report(label, r)} | {'SHA-256 OK' if ok else 'MISMATCH (kept in staging)'}",
+                  flush=True)
+    finally:
+        rx.close()
+        try:
+            os.rmdir(stage)                       # only succeeds when nothing failed
+        except OSError:
+            pass
+    total = sum(os.path.getsize(p) for p in placed)
+    elapsed = time.perf_counter() - t0
+    print(f"drop: {len(placed)} placed, {len(failed)} failed, {total / 2**20:.1f} MiB "
+          f"in {elapsed:.2f}s -> {dest}", flush=True)
+    return placed, failed
 
 
 def probe_mss(target, port):
@@ -865,11 +1088,21 @@ def main():
     r.add_argument("--mode", help="ignored: the receiver auto-detects record/stream per connection")
     r.add_argument("--clamp-mss", type=int, help="advertise a smaller MSS to simulate a small-MTU path")
     s = sub.add_parser("send", help="send files, blobs, SPF arms, or RS42 shards",
-                       description="Send one or more files using one independent XMT session per file, or --blob.",
-                       epilog=f"Example:\n  {QUICK_START}",
+                       description="Send files or folders (-r) to a receiver (--to) or a local folder (--drop), "
+                                   "one XMT session per file, or one session with --blob.",
+                       epilog=SEND_EXAMPLES,
                        formatter_class=CLIHelpFormatter, allow_abbrev=False)
-    s.add_argument("files", nargs="+", help="one or more files; each is an independent XMT session")
-    s.add_argument("--to", required=True, help="receiver host or host:port")
+    s.add_argument("files", nargs="+",
+                   help="files or folders (folders need -r); each file is an independent XMT session")
+    s.add_argument("-r", "--recursive", action="store_true",
+                   help="include folders and everything under them, keeping the folder structure")
+    s.add_argument("-L", "--follow-links", action="store_true", dest="follow_links",
+                   help="pack the files and folders symlinks point to, like cp -L (default: skip links)")
+    where = s.add_mutually_exclusive_group(required=True)
+    where.add_argument("--to", help="receiver host or host:port")
+    where.add_argument("--drop", metavar="DIR",
+                       help="local file drop: run the same pipeline over loopback into DIR "
+                            "(an SSD mount, say), verify each file by SHA-256, keep relative paths")
     s.add_argument("--port", type=int, default=47000, help="receiver port when --to omits one")
     s.add_argument("--streams", type=int, default=1,
                    help="parallel TCP streams; default 1 (best measured Raspberry Pi path)")
@@ -907,7 +1140,8 @@ def main():
         for name, parser in sub.choices.items():
             print(f"\n{'=' * 12} {name} settings {'=' * 12}")
             print(parser.format_help().rstrip())
-        print(f"\nQuick start:\n  {QUICK_START}")
+        print(f"\nQuick start:\n  {QUICK_START}\n  "
+              "python3 redtail.py send -r ./dir --drop /Volumes/SSD/test --RS42 --drop-shards 2 3")
         return
     a = ap.parse_args()
 
@@ -936,36 +1170,46 @@ def main():
             ap.error(str(error))
     else:
         cipher = "stream" if a.mode == "stream" else a.cipher
-        blob_path = build_blob(a.files) if a.blob else None
-        jobs = [(f"blob[{len(a.files)} files]", blob_path)] if blob_path else [(p, p) for p in a.files]
+        if a.rs42 and (a.hunt_spf or a.hunt_spf2):
+            ap.error("--HUNTSPF/--HUNTSPF2 are not applied under --RS42; "
+                     "use --HUNTSPF3 or --HUNTSPF4 to compose, or leave it off")
         try:
-            for label, path in jobs:
-                r = send_file(a.to, a.port, path, a.streams, a.record, a.curve, cipher,
-                              ckpt=a.checkpoint, huntspf=a.hunt_spf, huntspf2=a.hunt_spf2,
-                              huntspf3=a.hunt_spf3, huntspf4=a.hunt_spf4,
-                              rs42=a.rs42, drop_shards=a.drop_shards)
-                if r["size"] < 1 << 20:
-                    amount = f"{r['size']} B"
-                    rate = f"{r['size'] / r['elapsed'] / 1024:.1f} KiB/s"
-                else:
-                    amount = f"{r['size'] / 2**20:.1f} MiB"
-                    rate = f"{r['size'] / r['elapsed'] / 1e6:.1f} MB/s"
-                print(f"{label} -> {r['session']}.bin: path MSS {r['mss']} B -> record {r['record']} B | "
-                      f"{r['records']} records | {amount} in {r['elapsed']:.3f}s = {rate}", end="")
-                if r["spf_level"] >= 3 and r["rs42"]:
-                    print(f" | SPF{r['spf_level']}+RS42 shards {r['received_shards']} payload "
-                          f"{r['arm_payload_bytes'] / 2**20:.1f} MiB")
-                elif r["spf_level"] >= 3:
-                    print(f" | SPF{r['spf_level']} arm payload {r['arm_payload_bytes'] / 2**20:.1f} MiB")
-                elif r["rs42"]:
-                    print(f" | RS42 shards {r['received_shards']} payload "
-                          f"{r['arm_payload_bytes'] / 2**20:.1f} MiB")
-                else:
-                    print()
+            entries = expand_inputs(a.files, a.recursive, exclude=a.drop, follow=a.follow_links)
+        except ValueError as error:
+            ap.error(str(error))
+        if a.blob:
+            total = sum(os.path.getsize(path) for path, _ in entries)
+            if total > free_bytes(tempfile.gettempdir()):
+                ap.error(f"--blob builds a {total / 1e9:.1f} GB temporary container in "
+                         f"{tempfile.gettempdir()}, which lacks the space; set TMPDIR to a "
+                         "disk that has it")
+            print(f"blob: {len(entries)} files, {total / 1e9:.2f} GB", flush=True)
+        blob_path = build_blob(entries) if a.blob else None
+        if blob_path:
+            jobs = [(f"blob[{len(entries)} files]", blob_path,
+                     time.strftime("redtail-blob-%Y%m%d-%H%M%S.xbl1"))]
+        else:
+            jobs = [(rel if a.drop else path, path, rel) for path, rel in entries]
+        send_kw = dict(rec=a.record, curve=a.curve, cipher=cipher, ckpt=a.checkpoint,
+                       huntspf=a.hunt_spf, huntspf2=a.hunt_spf2, huntspf3=a.hunt_spf3,
+                       huntspf4=a.hunt_spf4, rs42=a.rs42, drop_shards=a.drop_shards)
+        try:
+            if a.drop:
+                try:
+                    placed, failed = local_drop(jobs, a.drop, a.streams, **send_kw)
+                except ValueError as error:
+                    ap.error(str(error))
+                if blob_path and placed:
+                    print(f"unpack with: {sys.argv[0]} unpack-blob {placed[0]} --out DIR")
+                if failed:
+                    sys.exit(f"{len(failed)} file(s) failed verification")
+            else:
+                for label, path, _ in jobs:
+                    print(send_report(label, send_file(a.to, a.port, path, a.streams, **send_kw)),
+                          flush=True)
         finally:
             if blob_path:
                 os.remove(blob_path)
-
 
 if __name__ == "__main__":
     main()
